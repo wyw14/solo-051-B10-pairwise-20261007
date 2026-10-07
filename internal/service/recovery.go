@@ -43,8 +43,19 @@ func (s *Service) Recover(ctx context.Context, runtime *Runtime, runID model.ID)
 		return report
 	}
 	report = appendRecovery(report, "load_run", nil)
-	shutterErr := runtime.Shutter.Close(ctx)
+	// Commit order: pending feedback -> device fact -> audit record -> durable
+	// journal -> closed feedback. If any step fails the feedback stays unknown
+	// and a later recovery must re-confirm the shutter instead of trusting it.
+	shutterErr := runtime.Shutter.Close(ctx, func() error {
+		return s.Journal.Append(journal.ShutterClosed(runID))
+	})
 	report = appendRecovery(report, "close_shutter", shutterErr)
+	if shutterErr == nil {
+		// Feedback is confirmed closed; mirror the fact into the chamber.
+		s.Chamber.SetShutter("closed")
+	} else {
+		s.Chamber.SetShutter("unknown")
+	}
 	s.Source.Stop()
 	report = appendRecovery(report, "stop_source", nil)
 	cooldown := chamber.DefaultCooldownPolicy()
@@ -54,9 +65,15 @@ func (s *Service) Recover(ctx context.Context, runtime *Runtime, runID model.ID)
 	incident := runtime.Incidents.Raise(runID, "warning", "run recovered to safe state")
 	journalErr := s.Journal.Append(journal.IncidentRaised(incident))
 	report = appendRecovery(report, "record_recovery", journalErr)
-	value.State = model.Cooling
-	s.Runs.Add(value)
-	report = appendRecovery(report, "set_cooling", nil)
+	if shutterErr == nil {
+		// The shutter is only a known safe fact once Close committed closed
+		// feedback; only then may the run leave its active/uncertain state.
+		value.State = model.Cooling
+		s.Runs.Add(value)
+		report = appendRecovery(report, "set_cooling", nil)
+	} else {
+		report = appendRecovery(report, "set_cooling", fmt.Errorf("skipped: shutter not confirmed closed"))
+	}
 	report.Recovered = shutterErr == nil && cooldownErr == nil && journalErr == nil
 	runtime.Timeline.Add(runID, "recovery", fmt.Sprintf("recovered=%t", report.Recovered))
 	return report

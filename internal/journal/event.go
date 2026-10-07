@@ -11,3 +11,6 @@ func RunStateChanged(run model.Run, previous model.RunState) model.Event {
 func IncidentRaised(incident model.Incident) model.Event {
 	return model.NewEvent("incident", incident.RunID, map[string]any{"severity": incident.Severity, "message": incident.Message})
 }
+func ShutterClosed(runID model.ID) model.Event {
+	return model.NewEvent("shutter.closed", runID, map[string]any{"state": "closed"})
+}
